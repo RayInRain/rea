@@ -99,6 +99,26 @@ alias policy. Mounted-folder paths that report a reparse tag are rejected by
 component admission; broader namespace variants remain unverified. Preserve
 requested and final handle coordinates rather than treating them as one identity.
 
+## Private endpoint file identity compatibility
+
+Some Windows file filters return `ERROR_INVALID_PARAMETER` (Win32 87) for
+`FileIdInfo` on a regular JSON file while exposing its complete 128-bit file ID
+through the parent directory. This can prevent REA from reading Ghidra's
+`bridge-endpoint.json` even when the file is plaintext.
+
+For an already verified private child, and only for that error, REA queries the
+retained parent with `FileIdExtdDirectoryInfo`. It matches the directory record
+to the opened child's NTFS file index, verifies the volume serial, and rechecks
+the open identity before returning the directory's complete ID. Unmatched IDs,
+nonzero extended identity bits, missing directory support, and other errors
+remain failures. Target admission is unchanged; DACL, reparse, retained-handle,
+and immutable-write checks still apply.
+
+The native verifier covers private JSON readback, distinct identities, volume
+binding, write protection, junction rejection, and awaited cleanup. The fallback
+is exercised on hosts exhibiting the file-filter failure; ordinary NTFS hosts
+exercise the direct `FileIdInfo` path.
+
 ## Real verification
 
 ```powershell

@@ -93,10 +93,68 @@ std::unique_ptr<File> openFile(const std::wstring& requested, DWORD access, bool
   return result;
 }
 
-napi_value identity(napi_env env, HANDLE handle, const std::wstring& path) {
+// Certain Windows file filters reject FileIdInfo for regular files while
+// returning the same complete 128-bit ID through guarded directory queries.
+// Use that representation only for a private child with a retained parent,
+// and bind the directory record to the already-open child's NTFS identity.
+static FILE_ID_INFO privateChildIdentity(HANDLE handle, HANDLE parent, const std::wstring& path) {
+  BY_HANDLE_FILE_INFORMATION child{};
+  FILE_ID_INFO parentInfo{};
+  require(GetFileInformationByHandle(handle, &child), "Read private child identity failed", path);
+  require(GetFileInformationByHandleEx(parent, FileIdInfo, &parentInfo, sizeof(parentInfo)),
+          "Read retained parent identity failed", path);
+  require(child.dwVolumeSerialNumber == static_cast<DWORD>(parentInfo.VolumeSerialNumber),
+          "Private child and parent volumes differ", path, ERROR_ACCESS_DENIED);
+  const ULONGLONG childId = (static_cast<ULONGLONG>(child.nFileIndexHigh) << 32) | child.nFileIndexLow;
+  require(childId != 0, "Private child has no stable file index", path, ERROR_NOT_SUPPORTED);
+  std::vector<unsigned char> page(65536);
+  bool restart = true;
+  for (;;) {
+    if (!GetFileInformationByHandleEx(parent, restart ? FileIdExtdDirectoryRestartInfo : FileIdExtdDirectoryInfo,
+                                      page.data(), static_cast<DWORD>(page.size()))) {
+      const auto error = GetLastError();
+      if (error == ERROR_NO_MORE_FILES) break;
+      throw Failure("Read private directory identities failed", path, error);
+    }
+    restart = false;
+    size_t offset = 0;
+    for (;;) {
+      require(offset + offsetof(FILE_ID_EXTD_DIR_INFO, FileName) <= page.size(),
+              "Invalid private directory identity record", path, ERROR_INVALID_DATA);
+      const auto* entry = reinterpret_cast<const FILE_ID_EXTD_DIR_INFO*>(page.data() + offset);
+      ULONGLONG low = 0, high = 0;
+      memcpy(&low, entry->FileId.Identifier, sizeof(low));
+      memcpy(&high, entry->FileId.Identifier + sizeof(low), sizeof(high));
+      if (low == childId && high == 0) {
+        BY_HANDLE_FILE_INFORMATION checked{};
+        require(GetFileInformationByHandle(handle, &checked) &&
+                checked.dwVolumeSerialNumber == child.dwVolumeSerialNumber &&
+                checked.nFileIndexHigh == child.nFileIndexHigh && checked.nFileIndexLow == child.nFileIndexLow,
+                "Private child identity changed during directory query", path, ERROR_ACCESS_DENIED);
+        FILE_ID_INFO result{};
+        result.VolumeSerialNumber = parentInfo.VolumeSerialNumber;
+        result.FileId = entry->FileId;
+        return result;
+      }
+      if (entry->NextEntryOffset == 0) break;
+      require(entry->NextEntryOffset >= offsetof(FILE_ID_EXTD_DIR_INFO, FileName) &&
+              entry->NextEntryOffset <= page.size() - offset,
+              "Invalid private directory identity offset", path, ERROR_INVALID_DATA);
+      offset += entry->NextEntryOffset;
+    }
+  }
+  throw Failure("Opened private child has no matching 128-bit directory identity", path, ERROR_NOT_SUPPORTED);
+}
+
+
+napi_value identity(napi_env env, HANDLE handle, const std::wstring& path, HANDLE retainedParent) {
   FILE_ID_INFO info{};
-  require(GetFileInformationByHandleEx(handle, FileIdInfo, &info, sizeof(info)),
-          "Stable 128-bit Windows file identity is unavailable", path);
+  if (!GetFileInformationByHandleEx(handle, FileIdInfo, &info, sizeof(info))) {
+    const auto error = GetLastError();
+    if (error != ERROR_INVALID_PARAMETER || retainedParent == INVALID_HANDLE_VALUE)
+      throw Failure("Stable 128-bit Windows file identity is unavailable", path, error);
+    info = privateChildIdentity(handle, retainedParent, path);
+  }
   std::array<wchar_t, 32768> finalPath;
   const auto length = GetFinalPathNameByHandleW(handle, finalPath.data(), finalPath.size(), FILE_NAME_NORMALIZED);
   require(length > 0 && length < finalPath.size(), "Read final handle path failed", path);
@@ -542,6 +600,7 @@ napi_value filesystemCall(napi_env env, const std::wstring& operation, const std
     auto file = runtimeDirectory(root, path.substr(0, path.find_last_of(L'\\')));
     file->path = path;
     file->requestedPath = path;
+    const auto retainedParent = file->get();
     // Retained output handles have write and DELETE access, so this read open
     // must share both to pass Windows' symmetric share check. Those retained
     // handles still omit FILE_SHARE_WRITE and FILE_SHARE_DELETE, blocking
@@ -550,7 +609,7 @@ napi_value filesystemCall(napi_env env, const std::wstring& operation, const std
                                           FILE_SHARE_READ | FILE_SHARE_WRITE |
                                               FILE_SHARE_DELETE));
     verifyPrivate(file->get(), path, false);
-    auto result = identity(env, file->get(), path);
+    auto result = identity(env, file->get(), path, retainedParent);
     set(env, result, "handle", wrap(env, std::move(file)));
     return result;
   }

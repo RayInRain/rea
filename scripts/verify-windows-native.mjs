@@ -140,6 +140,46 @@ process.stdout.write(JSON.stringify({executable:basename(process.execPath),abiVe
   ])
     assert.throws(() => native.call("open", [rejected]));
   report.controls.ordinaryDriveSeparatorsAndRequestedIdentity = true;
+  // Bridge endpoints are private JSON files. Some file filters reject their
+  // FileIdInfo query, so exercise real runtime reads and preserve identity and
+  // immutable leases rather than accepting path-only endpoint authority.
+  const endpointOwner = WindowsPrivateRuntime.create(workspace, "endpoint-id-");
+  try {
+    const identities = [];
+    for (const name of ["first.json", "second.json"]) {
+      endpointOwner.writeFile(name, '{"ready":true}');
+      assert.equal(endpointOwner.readFile(name), '{"ready":true}');
+      const child = native.call("runtime_open", [
+        endpointOwner.observation.handle,
+        name,
+      ]);
+      try {
+        assert.match(child.fileId, /^[a-f0-9]{32}$/u);
+        assert.equal(
+          child.volumeSerial,
+          endpointOwner.observation.volumeSerial,
+        );
+        identities.push(child.fileId);
+      } finally {
+        native.call("close", [child.handle]);
+      }
+      await assert.rejects(
+        writeFile(join(endpointOwner.observation.path, name), "replace"),
+      );
+    }
+    assert.notEqual(identities[0], identities[1]);
+    await symlink(
+      sourceDirectory,
+      join(endpointOwner.observation.path, "redirect"),
+      "junction",
+    );
+    assert.throws(() => endpointOwner.readFile("redirect/target.bin"));
+    assert.throws(() => endpointOwner.readFile("../outside.json"));
+  } finally {
+    await endpointOwner.close();
+  }
+  assert.equal(await exists(endpointOwner.observation.path), false);
+  report.controls.privateJsonEndpointIdentity = true;
   const driveRoot = parse(workspace).root;
   const runtimeParent = ghidraSessionRoot({
     base: join(driveRoot, ".Tmp", "scratch"),

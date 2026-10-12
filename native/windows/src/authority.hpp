@@ -122,7 +122,7 @@ Resource& resource(napi_env env, napi_value value, Kind kind);
 
 std::unique_ptr<File> openFile(const std::wstring& path, DWORD access = GENERIC_READ,
                              bool directory = false);
-napi_value identity(napi_env env, HANDLE handle, const std::wstring& path);
+napi_value identity(napi_env env, HANDLE handle, const std::wstring& path, HANDLE retainedParent = INVALID_HANDLE_VALUE);
 std::unique_ptr<Runtime> createRuntime(const std::wstring& parent, const std::wstring& prefix);
 void closeRuntime(Runtime& runtime);
 napi_value filesystemCall(napi_env env, const std::wstring& operation,
